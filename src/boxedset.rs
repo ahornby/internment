@@ -31,18 +31,6 @@ impl<P: Deref + Eq + Hash> HashSet<P> {
             .as_ref()
             .map(|kv| kv.0)
     }
-    pub fn take<Q: ?Sized + Hash + Eq>(&mut self, k: &Q) -> Option<P>
-    where
-        P: Borrow<Q>,
-    {
-        self.0.remove_entry(k).map(|(a, ())| a)
-        // let hash = {
-        //     let mut hasher = self.0.hasher().build_hasher();
-        //     key.hash(&mut hasher);
-        //     hasher.finish()
-        // };
-        // let x = self.0.raw_entry_mut().from_hash(hash, |k| <P::Target as Borrow<Q>>::borrow(k) == key)
-    }
     pub fn insert(&mut self, x: P) {
         self.0.insert(x, ());
     }

@@ -51,11 +51,13 @@ use lazy_static::lazy_static;
 
 mod boxedset;
 use boxedset::HashSet;
+use dashmap::DashMap;
+use once_cell::sync::OnceCell;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::borrow::Borrow;
 use std::convert::AsRef;
 use std::fmt::{Debug, Display, Pointer};
@@ -303,12 +305,12 @@ fn test_intern_set64() {
 /// assert_eq!(x, ArcIntern::from("hello"));
 /// assert_eq!(&*x, "hello"); // dereference an ArcIntern like a pointer
 /// ```
-pub struct ArcIntern<T: Eq + Hash + Send + 'static> {
+pub struct ArcIntern<T: Eq + Hash + Send + Sync + 'static> {
     pointer: *const RefCount<T>,
 }
 
-unsafe impl<T: Eq + Hash + Send> Send for ArcIntern<T> {}
-unsafe impl<T: Eq + Hash + Send> Sync for ArcIntern<T> {}
+unsafe impl<T: Eq + Hash + Send + Sync> Send for ArcIntern<T> {}
+unsafe impl<T: Eq + Hash + Send + Sync> Sync for ArcIntern<T> {}
 
 #[derive(Debug)]
 struct RefCount<T> {
@@ -340,16 +342,23 @@ impl<T> Deref for BoxRefCount<T> {
     }
 }
 
-type Container<T> = Mutex<HashSet<BoxRefCount<T>>>;
-impl<T: Eq + Hash + Send + 'static> ArcIntern<T> {
-    fn get_mutex() -> &'static Container<T> {
-        match CONTAINER.try_get::<Container<T>>() {
-            Some(m) => m,
-            None => {
-                CONTAINER.set::<Container<T>>(Mutex::new(HashSet::new()));
-                CONTAINER.get::<Container<T>>()
-            }
-        }
+type Container<T> = DashMap<BoxRefCount<T>,()>;
+type Untyped = Box<(dyn Any + Send + Sync + 'static)>;
+static ARC_CONTAINERS: OnceCell<DashMap<TypeId, Untyped>> = OnceCell::new();
+
+impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
+    fn get_container() -> dashmap::mapref::one::Ref<'static, TypeId, Untyped> {
+        let type_map = ARC_CONTAINERS.get_or_init(|| DashMap::new());
+        // Prefer taking the read lock to reduce contention, only use entry api if necessary.
+        let boxed = if let Some(boxed) = type_map.get(&TypeId::of::<T>()) {
+            boxed
+        } else {
+            type_map
+                .entry(TypeId::of::<T>())
+                .or_insert_with(|| Box::new(Container::<T>::new()))
+                .downgrade()
+        };
+        boxed
     }
 
     fn update_existing(b: &BoxRefCount<T>) -> Option<Self> {
@@ -371,7 +380,7 @@ impl<T: Eq + Hash + Send + 'static> ArcIntern<T> {
         }
     }
 
-    fn add_new(m: &mut HashSet<BoxRefCount<T>>, val: T) -> Self {
+    fn add_new(m: &Container::<T>, val: T) -> Self {
         let b = Box::new(RefCount {
             count: AtomicUsize::new(1),
             data: val,
@@ -379,7 +388,7 @@ impl<T: Eq + Hash + Send + 'static> ArcIntern<T> {
         let p = ArcIntern {
             pointer: b.borrow(),
         };
-        m.insert(BoxRefCount(b));
+        m.insert(BoxRefCount(b), ());
         return p;
     }
 
@@ -389,17 +398,17 @@ impl<T: Eq + Hash + Send + 'static> ArcIntern<T> {
     /// previously allocated.
     ///
     /// Note that `ArcIntern::new` is a bit slow, since it needs to check
-    /// a `HashMap` protected by a `Mutex`.
+    /// a `DashMap` protected by sharded `RwLock`s.
     pub fn new(val: T) -> Self {
         loop {
-            let mymutex = Self::get_mutex();
-            let mut m = mymutex.lock().unwrap();
+            let c = Self::get_container();
+            let m = c.downcast_ref::<Container<T>>().unwrap();
             if let Some(b) = m.get(&val) {
-                if let Some(p) = Self::update_existing(b) {
+                if let Some(p) = Self::update_existing(b.key()) {
                     return p;
                 }
             } else {
-                return Self::add_new(&mut m, val);
+                return Self::add_new(m, val);
             }
             // yield so that the object can finish being freed,
             // and then we will be able to intern a new copy.
@@ -411,19 +420,20 @@ impl<T: Eq + Hash + Send + 'static> ArcIntern<T> {
     /// If this value has not previously been
     /// interned, then `new` will allocate a spot for the value on the
     /// heap and generate that value using `T::from(val)`.
-    pub fn from<'a, Q: ?Sized + Eq + Hash + 'a>(val: &'a Q) -> ArcIntern<T>
+    pub fn from<'a, Q>(val: &'a Q) -> ArcIntern<T>
     where
         T: Borrow<Q> + From<&'a Q>,
+        Q: 'a + ?Sized + Eq + Hash + AsRef<T>
     {
         loop {
-            let mymutex = Self::get_mutex();
-            let mut m = mymutex.lock().unwrap();
-            if let Some(b) = m.get(val) {
-                if let Some(p) = Self::update_existing(b) {
+            let c = Self::get_container();
+            let m = c.downcast_ref::<Container<T>>().unwrap();
+            if let Some(b) = m.get(val.as_ref()) {
+                if let Some(p) = Self::update_existing(b.key()) {
                     return p;
                 }
             } else {
-                return Self::add_new(&mut m, val.into());
+                return Self::add_new(&m, val.into());
             }
             // yield so that the object can finish being freed,
             // and then we will be able to intern a new copy.
@@ -433,10 +443,8 @@ impl<T: Eq + Hash + Send + 'static> ArcIntern<T> {
     /// See how many objects have been interned.  This may be helpful
     /// in analyzing memory use.
     pub fn num_objects_interned() -> usize {
-        if let Some(m) = CONTAINER.try_get::<Container<T>>() {
-            return m.lock().unwrap().len();
-        }
-        0
+        let c = Self::get_container();
+        c.downcast_ref::<Container<T>>().map(|m| m.len()).unwrap_or(0)
     }
     /// Return the number of counts for this pointer.
     pub fn refcount(&self) -> usize {
@@ -444,7 +452,7 @@ impl<T: Eq + Hash + Send + 'static> ArcIntern<T> {
     }
 }
 
-impl<T: Eq + Hash + Send + 'static> Clone for ArcIntern<T> {
+impl<T: Eq + Hash + Send + Sync + 'static> Clone for ArcIntern<T> {
     fn clone(&self) -> Self {
         // First increment the count.  Using a relaxed ordering is
         // alright here, as knowledge of the original reference
@@ -458,7 +466,7 @@ impl<T: Eq + Hash + Send + 'static> Clone for ArcIntern<T> {
     }
 }
 
-impl<T: Eq + Hash + Send> Drop for ArcIntern<T> {
+impl<T: Eq + Hash + Send + Sync> Drop for ArcIntern<T> {
     fn drop(&mut self) {
         // (Quoting from std::sync::Arc again): Because `fetch_sub` is
         // already atomic, we do not need to synchronize with other
@@ -480,13 +488,14 @@ impl<T: Eq + Hash + Send> Drop for ArcIntern<T> {
             // dropped *before* the removed content is dropped, since it
             // might need to lock the mutex.
             let _removed;
-            let mut m = Self::get_mutex().lock().unwrap();
-            _removed = m.take(unsafe { &*self.pointer });
+            let c = Self::get_container();
+            let m = c.downcast_ref::<Container<T>>().unwrap();
+            _removed = m.remove(unsafe { &*self.pointer });
         }
     }
 }
 
-impl<T: Send + Hash + Eq> AsRef<T> for ArcIntern<T> {
+impl<T: Send + Sync + Hash + Eq> AsRef<T> for ArcIntern<T> {
     fn as_ref(&self) -> &T {
         unsafe { &(*self.pointer).data }
     }
@@ -635,8 +644,8 @@ macro_rules! create_impls {
 create_impls!(
     ArcIntern,
     arcintern_impl_tests,
-    [Eq, Hash, Send],
-    [Eq, Hash, Send]
+    [Eq, Hash, Send, Sync],
+    [Eq, Hash, Send, Sync]
 );
 create_impls!(Intern, intern_impl_tests, [], [Eq, Hash, Send]);
 create_impls!(LocalIntern, localintern_impl_tests, [], [Eq, Hash]);
@@ -655,7 +664,7 @@ impl<T: Debug> Debug for LocalIntern<T> {
         self.deref().fmt(f)
     }
 }
-impl<T: Eq + Hash + Send + Debug> Debug for ArcIntern<T> {
+impl<T: Eq + Hash + Send + Sync + Debug> Debug for ArcIntern<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         Pointer::fmt(&self.pointer, f)?;
         f.write_str(" : ")?;
