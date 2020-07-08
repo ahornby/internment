@@ -429,34 +429,31 @@ impl<T: Eq + Hash + Send + 'static> Arc<T> {
 
 impl<T: Eq + Hash + Send> Drop for ArcIntern<T> {
     fn drop(&mut self) {
+        let mut _maybe_removed: Arc<T> = self.clone_to_arc(); // Free the pointer *after* releasing the Mutex.
         // (Quoting from std::sync::Arc again): Because `fetch_sub` is
         // already atomic, we do not need to synchronize with other
         // threads unless we are going to delete the object. This same
         // logic applies to the below `fetch_sub` to the `weak` count.
         let count_was = unsafe { (*self.pointer).count.fetch_sub(1, Ordering::Release) };
-        if count_was == 2 {
+        if count_was == 3 {
             // Looks like we are ready to remove from the HashSet.  Ourselves and the
             // HashSet hold the only two pointers to this datum.
-            let _removed: Arc<T>; // Free the pointer *after* releasing the Mutex.
             let mut m = Self::get_mutex().lock().unwrap();
             // We shouldn't need to be more stringent than relaxed ordering below,
             // since we are holding a Mutex.
             let count_is = unsafe { (*self.pointer).count.load(Ordering::Relaxed) };
-            if count_is == 1 {
+            if count_is == 2 {
                 // Here we check the count again in case the pointer was added while
                 // we waited for the Mutex.  The count cannot *increase* in a racy way
                 // because that would require either that there be another copy of the
                 // ArcIntern (which we know doesn't exist because of the count) or
                 // someone holding the Mutex.
-                if let Some(interned) = m.take(&self.clone_to_arc()) {
+                if let Some(interned) = m.take(&_maybe_removed) {
                     assert_eq!(self.pointer, interned.pointer);
-                    _removed = interned;
-                    // if interned.pointer != self.pointer {
-                    //     m.insert(interned);
-                    // }
+                    _maybe_removed = interned;
                 }
             }
-        } else if count_was == 1 {
+        } else if count_was == 2 {
             // (Quoting from std::sync::Arc again): This fence is
             // needed to prevent reordering of use of the data and
             // deletion of the data.  Because it is marked `Release`,
