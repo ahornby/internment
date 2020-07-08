@@ -3,6 +3,53 @@ use std::collections::HashSet;
 
 use internment::{ArcIntern, Intern, LocalIntern};
 
+#[derive(Eq, PartialEq, Hash)]
+pub struct TestStruct(String,u64);
+
+// Trait so same test can run for ArcIntern and arc_interner::ArcIntern
+trait InternLike<T> {
+    fn new(val: T) -> Self;
+    fn num_objects_interned() -> usize;
+}
+
+impl<T: 'static + std::cmp::Eq + std::hash::Hash + Send + Sync> InternLike<T> for ArcIntern<T> {
+    fn new(val: T) -> Self {
+        ArcIntern::<T>::new(val)
+    }
+    fn num_objects_interned() -> usize {
+        ArcIntern::<T>::num_objects_interned()
+    }
+}
+
+impl<T: 'static + std::cmp::Eq + std::hash::Hash + Send + Sync> InternLike<T> for arc_interner::ArcIntern<T> {
+    fn new(val: T) -> Self {
+        arc_interner::ArcIntern::<T>::new(val)
+    }
+    fn num_objects_interned() -> usize {
+        arc_interner::ArcIntern::<T>::num_objects_interned()
+    }
+}
+
+// Quickly create and destroy a small number of interned objects from
+// multiple threads.
+fn multithreading<T: InternLike<TestStruct>>() {
+    use std::thread;
+    let mut thandles = vec![];
+    for _i in 0..10 {
+        thandles.push(thread::spawn(|| {
+            for _i in 0..100_000 {
+                let _interned1 = T::new(TestStruct("foo".to_string(), 5));
+                let _interned2 = T::new(TestStruct("bar".to_string(), 10));
+            }
+        }));
+    }
+    for h in thandles.into_iter() {
+        h.join().unwrap()
+    }
+
+    assert_eq!(T::num_objects_interned(), 0);
+}
+
 fn main() {
     Intern::new(0i64);
     LocalIntern::new(0i64);
@@ -187,6 +234,10 @@ fn main() {
     }
     let i = ArcIntern::new(7i64);
     println!("ArcIntern<i64>::clone {}", bench(|| i.clone()));
+    println!(
+        "ArcIntern<TestStruct> multithreading {}",
+        bench(|| multithreading::<arc_interner::ArcIntern<TestStruct>>())
+    );
     println!();
 
     println!(
@@ -241,10 +292,16 @@ fn main() {
             bench_gen_env(|| (s1.clone(), s2.clone()), rmset)
         );
     }
+
     let i = arc_interner::ArcIntern::new(7i64);
     println!(
         "arc_interner::ArcIntern<i64>::clone {}",
         bench(|| i.clone())
+    );
+
+    println!(
+        "arc_interner::ArcIntern<TestStruct> multithreading {}",
+        bench(|| multithreading::<arc_interner::ArcIntern<TestStruct>>())
     );
     println!();
 }
