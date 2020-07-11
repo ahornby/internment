@@ -351,6 +351,38 @@ impl<T: Eq + Hash + Send + 'static> ArcIntern<T> {
             }
         }
     }
+
+    fn update_existing(b: &BoxRefCount<T>) -> Option<Self> {
+        // First increment the count.  We can use relaxed ordering
+        // here because we are holding the mutex, which has its
+        // own barriers.
+        let oldval = b.0.count.fetch_add(1, Ordering::Relaxed);
+        if oldval != 0 {
+            // we can only use this value if the value is not about to be freed
+            Some(ArcIntern {
+                pointer: b.0.borrow(),
+            })
+        } else {
+            // we have encountered a race condition here.
+            // we will just wait for the object to finish
+            // being freed.
+            b.0.count.fetch_sub(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    fn add_new(m: &mut HashSet<BoxRefCount<T>>, val: T) -> Self {
+        let b = Box::new(RefCount {
+            count: AtomicUsize::new(1),
+            data: val,
+        });
+        let p = ArcIntern {
+            pointer: b.borrow(),
+        };
+        m.insert(BoxRefCount(b));
+        return p;
+    }
+
     /// Intern a value.  If this value has not previously been
     /// interned, then `new` will allocate a spot for the value on the
     /// heap.  Otherwise, it will return a pointer to the object
@@ -358,36 +390,16 @@ impl<T: Eq + Hash + Send + 'static> ArcIntern<T> {
     ///
     /// Note that `ArcIntern::new` is a bit slow, since it needs to check
     /// a `HashMap` protected by a `Mutex`.
-    pub fn new(val: T) -> ArcIntern<T> {
+    pub fn new(val: T) -> Self {
         loop {
             let mymutex = Self::get_mutex();
             let mut m = mymutex.lock().unwrap();
             if let Some(b) = m.get(&val) {
-                // First increment the count.  We can use relaxed ordering
-                // here because we are holding the mutex, which has its
-                // own barriers.
-                let oldval = b.0.count.fetch_add(1, Ordering::Relaxed);
-                if oldval != 0 {
-                    // we can only use this value if the value is not about to be freed
-                    return ArcIntern {
-                        pointer: b.0.borrow(),
-                    };
-                } else {
-                    // we have encountered a race condition here.
-                    // we will just wait for the object to finish
-                    // being freed.
-                    b.0.count.fetch_sub(1, Ordering::Relaxed);
+                if let Some(p) = Self::update_existing(b) {
+                    return p;
                 }
             } else {
-                let b = Box::new(RefCount {
-                    count: AtomicUsize::new(1),
-                    data: val,
-                });
-                let p = ArcIntern {
-                    pointer: b.borrow(),
-                };
-                m.insert(BoxRefCount(b));
-                return p;
+                return Self::add_new(&mut m, val);
             }
             // yield so that the object can finish being freed,
             // and then we will be able to intern a new copy.
@@ -407,31 +419,11 @@ impl<T: Eq + Hash + Send + 'static> ArcIntern<T> {
             let mymutex = Self::get_mutex();
             let mut m = mymutex.lock().unwrap();
             if let Some(b) = m.get(val) {
-                // First increment the count.  We can use relaxed ordering
-                // here because we are holding the mutex, which has its
-                // own barriers.
-                let oldval = b.0.count.fetch_add(1, Ordering::Relaxed);
-                if oldval != 0 {
-                    // we can only use this value if the value is not about to be freed
-                    return ArcIntern {
-                        pointer: b.0.borrow(),
-                    };
-                } else {
-                    // we have encountered a race condition here.
-                    // we will just wait for the object to finish
-                    // being freed.
-                    b.0.count.fetch_sub(1, Ordering::Relaxed);
+                if let Some(p) = Self::update_existing(b) {
+                    return p;
                 }
             } else {
-                let b = Box::new(RefCount {
-                    count: AtomicUsize::new(1),
-                    data: val.into(),
-                });
-                let p = ArcIntern {
-                    pointer: b.borrow(),
-                };
-                m.insert(BoxRefCount(b));
-                return p;
+                return Self::add_new(&mut m, val.into());
             }
             // yield so that the object can finish being freed,
             // and then we will be able to intern a new copy.
