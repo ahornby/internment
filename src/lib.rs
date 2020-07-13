@@ -51,7 +51,7 @@ use lazy_static::lazy_static;
 
 mod boxedset;
 use boxedset::HashSet;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use once_cell::sync::OnceCell;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -330,6 +330,11 @@ impl<T: Hash> Hash for RefCount<T> {
 }
 #[derive(Eq, PartialEq, Hash)]
 struct BoxRefCount<T>(Box<RefCount<T>>);
+impl<T> Borrow<T> for BoxRefCount<T> {
+    fn borrow(&self) -> &T {
+        &self.0.data
+    }
+}
 impl<T> Borrow<RefCount<T>> for BoxRefCount<T> {
     fn borrow(&self) -> &RefCount<T> {
         &self.0
@@ -380,16 +385,26 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
         }
     }
 
-    fn add_new(m: &Container::<T>, val: T) -> Self {
+    fn add_new(m: &Container::<T>, val: T) -> Result<ArcIntern<T>, T> {
         let b = Box::new(RefCount {
             count: AtomicUsize::new(1),
             data: val,
         });
-        let p = ArcIntern {
-            pointer: b.borrow(),
-        };
-        m.insert(BoxRefCount(b), ());
-        return p;
+
+        match m.entry(BoxRefCount(b)) {
+            Entry::Vacant(e) => {
+                Ok(ArcIntern {
+                    pointer: e.insert(()).key().borrow()
+                })
+            },
+            Entry::Occupied(e) => {
+                match Self::update_existing(e.key()) {
+                    Some(p) => Ok(p),
+                    // And so did the update of the count
+                    None => Err(e.into_key().0.data)
+                }
+            }
+        }
     }
 
     /// Intern a value.  If this value has not previously been
@@ -399,7 +414,7 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     ///
     /// Note that `ArcIntern::new` is a bit slow, since it needs to check
     /// a `DashMap` protected by sharded `RwLock`s.
-    pub fn new(val: T) -> Self {
+    pub fn new(mut val: T) -> Self {
         loop {
             let c = Self::get_container();
             let m = c.downcast_ref::<Container<T>>().unwrap();
@@ -408,7 +423,10 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
                     return p;
                 }
             } else {
-                return Self::add_new(m, val);
+                match Self::add_new(m, val) {
+                    Ok(p) => return p,
+                    Err(v) => val=v,
+                }
             }
             // yield so that the object can finish being freed,
             // and then we will be able to intern a new copy.
@@ -423,22 +441,11 @@ impl<T: Eq + Hash + Send + Sync + 'static> ArcIntern<T> {
     pub fn from<'a, Q>(val: &'a Q) -> ArcIntern<T>
     where
         T: Borrow<Q> + From<&'a Q>,
-        Q: 'a + ?Sized + Eq + Hash + AsRef<T>
+        Q: 'a + ?Sized + Eq + Hash,
     {
-        loop {
-            let c = Self::get_container();
-            let m = c.downcast_ref::<Container<T>>().unwrap();
-            if let Some(b) = m.get(val.as_ref()) {
-                if let Some(p) = Self::update_existing(b.key()) {
-                    return p;
-                }
-            } else {
-                return Self::add_new(&m, val.into());
-            }
-            // yield so that the object can finish being freed,
-            // and then we will be able to intern a new copy.
-            std::thread::yield_now();
-        }
+        // No reference only path as
+        // the trait `std::borrow::Borrow<Q>` is not implemented for `BoxRefCount<T>`
+        Self::new(val.into())
     }
     /// See how many objects have been interned.  This may be helpful
     /// in analyzing memory use.
@@ -490,7 +497,9 @@ impl<T: Eq + Hash + Send + Sync> Drop for ArcIntern<T> {
             let _removed;
             let c = Self::get_container();
             let m = c.downcast_ref::<Container<T>>().unwrap();
-            _removed = m.remove(unsafe { &*self.pointer });
+            _removed = m.remove_if(unsafe { &*self.pointer }, |k, _v| {
+                0 == k.0.count.load(Ordering::Relaxed)
+            });
         }
     }
 }

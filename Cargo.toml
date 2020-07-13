@@ -23,7 +23,7 @@ maintenance = { status = "actively-developed" }
 
 [dependencies]
 
-dashmap = "3.11"
+dashmap = { git = "https://github.com/ahornby/dashmap", branch = "entry_into_key" }
 once_cell = "1.4"
 lazy_static = "1.4.0"
 state = { version = "0.4.1", features = ["tls"] }
